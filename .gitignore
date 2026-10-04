@@ -1,0 +1,31 @@
+# Env
+.env
+.env.local
+
+# Backend
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+*.pyc
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+
+# OS / editor
+.DS_Store
+.vscode/
+*.log
+frontend/*.tsbuildinfo
+
+# Alembic-generated (kept locally, not for repo hygiene reasons but this
+# project's __pycache__ pattern above already covers bytecode; nothing else
+# to add here for migrations)
+
+# Local file storage for uploaded documents (dev only)
+backend/data/

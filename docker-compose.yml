@@ -1,0 +1,138 @@
+# Run `cp .env.example .env` first (repo root) — this file is both what
+# Compose itself interpolates ${VAR} references from below, and what
+# api/worker load wholesale via env_file. See ADR-019 for the full design
+# reasoning, including what's genuinely verified here vs. what needs a
+# machine with normal Docker registry access (this sandbox's `docker`
+# daemon runs, but registry-1.docker.io is blocked — confirmed directly,
+# not assumed).
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-enterprise_ai_platform}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+
+  api:
+    build:
+      context: ./backend
+    env_file:
+      - ./.env
+    environment:
+      # Topology-dependent values — the rest of this container's config
+      # comes from ./.env unchanged (see the env_file above), but these
+      # three must point at the Docker service hostnames, not `localhost`,
+      # which is what ./.env's own DATABASE_URL/REDIS_URL/STORAGE_ROOT say
+      # (correct for local non-Docker dev, wrong inside this network).
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-enterprise_ai_platform}
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_ROOT: /app/data/uploads
+    ports:
+      - "8000:8000"
+    volumes:
+      - api_uploads:/app/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    # Slightly longer than uvicorn's own --timeout-graceful-shutdown (30s,
+    # set in the Dockerfile CMD) so Docker's SIGKILL doesn't cut that off
+    # right at the boundary before uvicorn's own clean-exit logic finishes.
+    stop_grace_period: 35s
+    deploy:
+      resources:
+        limits:
+          # sentence-transformers/torch load a real embedding model
+          # in-process (ADR-008) - meaningfully heavier than a typical
+          # thin API service.
+          cpus: "2.0"
+          memory: 2g
+
+  worker:
+    build:
+      context: ./backend
+    # Overrides the image's default CMD entirely — no migration step here,
+    # see ADR-019 decision 2 and backend/docker-entrypoint.sh's conditional.
+    command: ["arq", "app.workers.settings.WorkerSettings"]
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-enterprise_ai_platform}
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_ROOT: /app/data/uploads
+    volumes:
+      - api_uploads:/app/data/uploads
+    depends_on:
+      api:
+        # Not just service_started — waits for api's healthcheck, which
+        # only passes once migrations have actually completed (ADR-019
+        # decision 2), so the worker never races api's own migration step.
+        condition: service_healthy
+    # Coordinated with app/workers/settings.py's job_completion_wait=30 —
+    # same reasoning as api's stop_grace_period above.
+    stop_grace_period: 35s
+    deploy:
+      resources:
+        limits:
+          # Same reasoning as api — the worker loads the same embedding
+          # model in-process to process documents (ADR-008).
+          cpus: "2.0"
+          memory: 2g
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    deploy:
+      resources:
+        limits:
+          # A Next.js standalone server serving static pages + client-side
+          # API calls (ADR-015) - no heavy in-process workload like api/worker.
+          cpus: "1.0"
+          memory: 512m
+
+volumes:
+  postgres_data:
+  api_uploads:
